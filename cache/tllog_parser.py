@@ -72,8 +72,11 @@ if __name__ == "__main__":
 
     for cc in caches:
         a_addr_current_source = -1 # used to pair Acquire - Grant
+        a_addr_pending_beats = 0   # remaining beats for GrantData
         c_addr_current_source = -1 # used to pair Release - ReleaseAck
+        c_addr_pending_beats = 0   # remaining beats for ReleaseAck (usually 1)
         chn_all_signals = {}
+        data_bus_bytes = None      # will be determined from d_data signal length
 
         for chn in ['a', 'b', 'c', 'd']:
             chn_all_signals[chn] = {
@@ -83,8 +86,18 @@ if __name__ == "__main__":
                 "address": get_signal_by_name(f"{cc}.auto_out_{chn}_bits_address"),
                 "param": get_signal_by_name(f"{cc}.auto_out_{chn}_bits_param"),
                 "source": get_signal_by_name(f"{cc}.auto_out_{chn}_bits_source"),
+                "size": get_signal_by_name(f"{cc}.auto_out_{chn}_bits_size"),
                 "data": get_signal_by_name(f"{cc}.auto_out_{chn}_bits_data")
             }
+
+        # 从 D 通道 data 信号位宽计算数据总线字节数
+        d_data_signal = chn_all_signals['d']['data']
+        if d_data_signal:
+            data_bus_bytes = d_data_signal.length // 8
+            if data_bus_bytes == 0:
+                data_bus_bytes = 1  # 最小 1 字节
+        else:
+            data_bus_bytes = 8  # 默认 64-bit
 
         for ts in range(0, timestamps.nvals, 2): # step 2 to skip negedge
             time = timestamps.val[ts]
@@ -103,8 +116,15 @@ if __name__ == "__main__":
 
                             if chn == 'a':
                                 a_addr_current_source = source
+                                # 计算 GrantData 需要的拍数: 2^size / 数据总线宽度
+                                size = get_value(chn_all_signals[chn]["size"])
+                                total_bytes = 1 << size
+                                a_addr_pending_beats = max(1, total_bytes // data_bus_bytes)
                             if chn == 'c' and (opcode == 6 or opcode == 7): # Release or ReleaseData
                                 c_addr_current_source = source
+                                size = get_value(chn_all_signals[chn]["size"])
+                                total_bytes = 1 << size
+                                c_addr_pending_beats = max(1, total_bytes // data_bus_bytes)
                             
                             param = get_value(chn_all_signals[chn]["param"])
                             data = get_value(chn_all_signals[chn]["data"])
@@ -123,13 +143,17 @@ if __name__ == "__main__":
 
                     else: # chn == 'd'
                         opcode = get_value(chn_all_signals[chn]["opcode"])
-                        d_match_a = (opcode == 4 or opcode == 5) and source == a_addr_current_source
-                        d_match_c = opcode == 6 and source == c_addr_current_source
+                        d_match_a = (opcode == 4 or opcode == 5) and source == a_addr_current_source and a_addr_pending_beats > 0
+                        d_match_c = opcode == 6 and source == c_addr_current_source and c_addr_pending_beats > 0
 
                         if d_match_a:
-                            a_addr_current_source = -1 # avoid redundant match across different reqs, and this will reduce two Data beats to one
+                            a_addr_pending_beats -= 1
+                            if a_addr_pending_beats == 0:
+                                a_addr_current_source = -1  # 所有拍都处理完毕
                         if d_match_c:
-                            c_addr_current_source = -1
+                            c_addr_pending_beats -= 1
+                            if c_addr_pending_beats == 0:
+                                c_addr_current_source = -1
                         if d_match_a or d_match_c:
                             param = get_value(chn_all_signals[chn]["param"])
                             data = get_value(chn_all_signals[chn]["data"])
