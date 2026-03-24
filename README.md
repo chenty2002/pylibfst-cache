@@ -29,13 +29,18 @@ For details of Installation, Usage and Examples of pylibfst, check [pylibfst/REA
 
 - `cache/deadlock_parser.py`:
 	- Functions such as `dumpInfo`, `detect_cache_widths`, `first_halt_mshrid`, and `dump_signals` can be imported to introspect traces programmatically.
-	- The CLI (`python cache/deadlock_parser.py <trace.fst>`) opens a trace via `pylibfst.lib`, auto-detects tag/set/offset widths, and reports MSHRs that stay asserted until the final timestamp.
+    - The CLI (`python cache/deadlock_parser.py <trace.fst>`) opens a trace via `pylibfst.lib`, auto-detects tag/set/offset widths, and reports MSHRs that stay asserted until the final timestamp.
 - `cache/tllog_parser.py`:
 	- Helper functions `opcode_str`, `param_str`, and `tllog_site` normalize TileLink fields.
-	- When run as a script it filters a waveform for a target address, pairs Acquire/Grant and Release/ReleaseAck transactions, and emits a chronological log of the handshake beats.
+    - When run as a script it filters a waveform for a target address, pairs Acquire/Grant and Release/ReleaseAck transactions (including multi-beat transfers), and emits a chronological log of handshake beats.
+    - It skips incomplete channel bundles gracefully (instead of failing) when an endpoint is missing some signals in the trace.
 - `cache/tllog_visual.py`:
-	- Exposes `parse_log(log_text)` to render the parser output as a multi-column timeline and highlight state mismatches.
+    - Exposes `parse_log(log_text)` to render the parser output as a multi-column timeline and highlight state mismatches.
+    - Supports multi-beat data opcodes (`ReleaseData`, `ProbeAckData`, `GrantData`) and displays merged data beats as `[beat0,beat1]`.
 	- Provides a CLI (`python cache/tllog_visual.py tl.log`) that expects the sorted log emitted by `tllog_parser.py`.
+- `cache/coherence_checker.py`:
+    - Checks coherence properties directly from FST (all addresses) or from a parser log (`--log`).
+    - Reports violation contexts for L2 peer mutual exclusion, L1/L2 legality (inclusive constraints), and related state-transition inconsistencies.
 
 All of the above modules use the same CFFI bindings, so they can be mixed and matched—for example, importing `detect_cache_widths` alongside `helpers.get_scopes_signals2` to build custom analyses.
 
@@ -51,7 +56,7 @@ To work out-of-the-box the waveform must satisfy:
 - **File format**: GTKWave `.fst` produced with rising-edge sampling (the scripts iterate timestamps in steps of two to skip negedges).
 - **Hierarchy anchors**: top-level scope `VerifyTop` with child instances `coupledL2`, `coupledL2_1`, `coupledL2AsL1`, and `coupledL2AsL1_1` for TileLink channels, plus `VerifyTop.l3` for the last-level cache.
 - **MSHR signals**: per-slice signals following the pattern `...mshrs_<index>.req_valid`, along with matching `req_tag`, `req_set`, and `req_off` bitfields that either expose single-bit names or append ` [<msb>:0]` to the signal name.
-- **TileLink bus signals**: channel bundles exported as `auto_out_<channel>_{valid,ready,bits_opcode,bits_param,bits_address,bits_source,bits_data}` for channels A/B/C/D.
+- **TileLink bus signals**: channel bundles exported as `auto_out_<channel>_{valid,ready,bits_opcode,bits_param,bits_address,bits_source,bits_size,bits_data}` for channels A/B/C/D.
 
 Other hierarchies can be supported by adjusting the regexes in the scripts, but the above layout matches the shipped automation.
 
@@ -73,8 +78,9 @@ This script identifies cache deadlocks by reporting MSHRs that stay asserted at 
 
 `tllog_parser.py` reconstructs the TileLink transaction timeline for a single cache-line address. It walks all timestamped value changes, applies the TileLink handshake rules (`valid & ready`), and prints a concise log that records the site, channel, opcode mnemonic, param mnemonic, and accompanying data beats.
 
-- **Address filter**: provide the desired address in hex; the parser keeps track of Acquire/Grant and Release/ReleaseAck pairings to suppress duplicate beats.
-- **Channel coverage**: channels A–D are handled directly from the waveform; channel E is not required for the current use case.
+- **Address filter**: provide the desired address in hex; the parser tracks source IDs and expected beats to pair Acquire/GrantData and Release/ReleaseAck correctly.
+- **Channel coverage**: channels A-D are handled directly from the waveform; channel E is not required for the current use case.
+- **Robustness**: missing channel fields on partial traces are skipped safely instead of raising `NoneType` attribute errors.
 - **Usage**:
 	```bash
 	python3 cache/tllog_parser.py <path/to/trace.fst> <target_addr_hex>
@@ -85,13 +91,40 @@ This script identifies cache deadlocks by reporting MSHRs that stay asserted at 
 The visualizer consumes the sorted log produced by `tllog_parser.py` and renders a terminal timeline across the L1/L2/L3 hierarchy. Each column represents a link between cache levels, and per-node state (N/B/T) is tracked to detect illegal transitions.
 
 - **State consistency checks**: Release/ProbeAck beats that report a state inconsistent with the latest Grant observation are highlighted as potential bugs.
-- **Duplicate filtering**: repeated beats (e.g., the second cycle of `ReleaseData`) are skipped to keep the timeline compact.
+- **Multi-beat display**: repeated beats for `ReleaseData`/`ProbeAckData`/`GrantData` are merged and shown as `[beat0,beat1]` to keep the timeline compact.
+- **Layout**: prints time on both left and right sides to improve readability on wide traces.
 - **Usage**:
 
 	```bash
 	python3 cache/tllog_parser.py <trace> <addr> | sort -k 1 -n > tl.log
 	python3 cache/tllog_visual.py tl.log
 	```
+
+### `cache/coherence_checker.py`
+
+`coherence_checker.py` verifies cache coherence properties from either a waveform or parser log and prints focused context around violations.
+
+- **Input modes**:
+    - FST mode: parse all addresses from waveform transactions and check each address independently.
+    - Log mode (`--log`): consume text output from `tllog_parser.py`.
+- **Checks performed**:
+    - L2 peer mutual exclusion violations.
+    - L1/L2 legality violations under inclusive constraints.
+    - Inclusive violations where L1 is valid but parent L2 is invalid.
+- **Output style**:
+    - Reuses timeline-like rows and prints violation-centered windows (`--context`) for quick triage.
+
+```bash
+# FST mode (all addresses)
+python3 cache/coherence_checker.py <path/to/trace.fst>
+
+# FST mode (single address)
+python3 cache/coherence_checker.py <path/to/trace.fst> --addr 0x14
+
+# Log mode
+python3 cache/tllog_parser.py <trace> 0x14 | sort -k 1 -n > tl.log
+python3 cache/coherence_checker.py --log tl.log --addr 0x14
+```
 
 ![tllog_visual](cache/doc/tllog_visual.png)
 
@@ -393,23 +426,12 @@ python3 cache/deadlock_parser.py <fst_path>
 - Identifies all pending MSHRs at deadlock
 - Extracts start time, end time, address, and unfinished state machines
 - Provides color-coded visual output for analysis
-
-**Configuration Requirements:**
-```python
-# Manual configuration needed for each cache configuration:
-l1tagbits = 3
-l1setbits = 1
-l2tagbits = 2
-l2setbits = 2
-l3tagbits = 2
-l3setbits = 2
-offsetbits = 1
-```
+- Auto-detects tag/set/offset widths from signal names with safe fallback defaults
 
 **Signal Requirements:**
 The FST waveform must contain:
 - MSHR valid signals indicating active entries
-- Address fields matching the configured tag/set/offset bit widths
+- Address fields (`req_tag`, `req_set`, `req_off`) for reconstructing addresses
 - State machine status signals for tracking unfinished operations
 
 **Output:**
@@ -418,9 +440,8 @@ The FST waveform must contain:
 - Colored indicators for different state types
 
 **Limitations:**
-- Requires manual modification of signal names for different cache configurations
-- Tag/set width must be specified in code
-- Future enhancement: Add replaced block information when release-related states are unfinished
+- Signal regexes are tuned for the shipped VerifyTop hierarchy; custom hierarchies may require regex updates
+- Unknown (`x`/`z`) address bits are treated as zero during address reconstruction
 
 **Example Output:**
 ```
@@ -431,7 +452,7 @@ MSHR[2]: addr=0x2040, state=WAIT_PROBE_ACK, start=11800, end=12345
 
 ---
 
-### Transaction Log Parser and Visualizer
+### Transaction Log Parser, Visualizer, and Coherence Checker
 
 **Purpose:** Extracts and visualizes TileLink transactions for a specific memory address across all cache levels.
 
@@ -450,9 +471,10 @@ python3 cache/tllog_visual.py tl.log
 
 **Features:**
 1. **Transaction Extraction:**
-   - Monitors all TileLink channels (A, B, C, D, E)
+    - Monitors TileLink channels A-D
    - Filters transactions by target address
-   - Records opcode, parameters, and data for each transaction
+    - Records opcode, parameters, and data for each transaction
+    - Matches multi-beat flows using source IDs and `size`-derived beat counts
 
 2. **Multi-Level Cache Support:**
    - Tracks transactions across L1, L2, and L3 cache levels
@@ -470,7 +492,11 @@ python3 cache/tllog_visual.py tl.log
 4. **Transaction Pairing:**
    - Matches Acquire → Grant sequences using source ID
    - Matches Release → ReleaseAck sequences
-   - Reduces redundant Data beat logs
+    - Handles multi-beat GrantData/ReleaseData consistently
+
+5. **Robust Trace Handling:**
+    - Skips incomplete per-channel signal bundles for endpoints that are partially dumped
+    - Avoids `NoneType` crashes when some interfaces are absent in the FST
 
 **Signal Requirements:**
 The FST file must contain TileLink channel signals for each cache level:
@@ -481,10 +507,11 @@ The FST file must contain TileLink channel signals for each cache level:
 <cache_instance>.auto_out_<channel>_bits_address
 <cache_instance>.auto_out_<channel>_bits_param
 <cache_instance>.auto_out_<channel>_bits_source
+<cache_instance>.auto_out_<channel>_bits_size
 <cache_instance>.auto_out_<channel>_bits_data
 ```
 
-Where `<channel>` is one of: `a`, `b`, `c`, `d`, `e`
+Where `<channel>` is one of: `a`, `b`, `c`, `d`
 
 **TileLink Operations Decoded:**
 
@@ -494,7 +521,6 @@ Where `<channel>` is one of: `a`, `b`, `c`, `d`, `e`
 | B | 0-6 | PutFullData, PutPartialData, ArithmeticData, LogicalData, Get, Hint, Probe | Master requests |
 | C | 0-7 | AccessAck, AccessAckData, HintAck, ProbeAck, ProbeAckData, Release, ReleaseData | Client responses |
 | D | 0-6 | AccessAck, AccessAckData, HintAck, Grant, GrantData, ReleaseAck | Master responses |
-| E | 0 | GrantAck | Grant acknowledgement |
 
 **Parameters:**
 - Capability: `toT` (to Top), `toB` (to Branch), `toN` (to None)
@@ -510,7 +536,6 @@ Example:
 ```
 1000  L3_L2[0]        A AcquireBlock  X NtoT 0
 1005  L3_L2[0]        D GrantData     X toT  deadbeef
-1010  L3_L2[0]        E GrantAck      X      0
 ```
 
 **Visualization Output:**
@@ -518,15 +543,17 @@ Example:
 - State transition tracking
 - Error highlighting for state inconsistencies
 - Color-coded cache levels and operation types
+- Merged two-beat data display for data-carrying opcodes
 
 **Performance Optimization:**
 The tool processes cache levels sequentially (L20 → L21 → L10 → L11) then sorts by time, which is more efficient than processing all levels simultaneously.
 
-**Error Detection:**
-The state checker identifies:
-- Silent eviction violations (when enabled)
-- State transition inconsistencies
-- Protocol violations where client state doesn't match reported state
+**Coherence Property Checking:**
+`coherence_checker.py` extends timeline-based debugging with property checks on top of parsed events:
+- L2 peer mutual exclusion violations
+- L1/L2 legal-state violations (inclusive constraints)
+- Inclusive violations where L1 is valid while L2 is invalid
+- Violation-focused context windows for faster root-cause analysis
 
 **Example Debugging Scenario:**
 ```
@@ -566,10 +593,11 @@ For `deadlock_parser.py`:
 - State machine status signals
 - Clock signal for timestamp reference
 
-For `tllog_parser.py` and `tllog_visual.py`:
-- All TileLink channel signals (A, B, C, D, E) with standard naming
+For `tllog_parser.py`, `tllog_visual.py`, and `coherence_checker.py`:
+- TileLink channel signals (A, B, C, D) with standard naming
 - Valid/ready handshake signals for each channel
 - Opcode, address, param, source, and data fields
+- `bits_size` for accurate multi-beat inference
 - Signals must follow naming convention: `<instance>.auto_out_<ch>_<field>`
 
 ### Signal Width Conventions
