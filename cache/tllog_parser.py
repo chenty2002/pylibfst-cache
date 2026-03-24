@@ -66,6 +66,15 @@ if __name__ == "__main__":
         return int(pylibfst.helpers.string(
                 pylibfst.lib.fstReaderGetValueFromHandleAtTime(
                 fst, time, signal.handle, buf)), base = base)
+
+    def has_required_signals(signals_map, channel):
+        # Some traces do not contain all channels/interfaces for every cache endpoint.
+        # Skip incomplete channels instead of crashing on None.handle.
+        if channel == 'd':
+            required = ["valid", "ready", "source", "opcode", "param", "data"]
+        else:
+            required = ["valid", "ready", "source", "opcode", "address", "param", "size", "data"]
+        return all(signals_map.get(name) is not None for name in required)
     # ===========================================
     Top = "VerifyTop"
     caches = [Top + "." + cc for cc in ["coupledL2", "coupledL2_1", "coupledL2AsL1", "coupledL2AsL1_1"]]
@@ -103,31 +112,35 @@ if __name__ == "__main__":
             time = timestamps.val[ts]
 
             for chn in ['a', 'b', 'c', 'd']:
-                valid = get_value(chn_all_signals[chn]["valid"])
-                ready = get_value(chn_all_signals[chn]["ready"])
-                source = get_value(chn_all_signals[chn]["source"])
+                chn_signals = chn_all_signals[chn]
+                if not has_required_signals(chn_signals, chn):
+                    continue
+
+                valid = get_value(chn_signals["valid"])
+                ready = get_value(chn_signals["ready"])
+                source = get_value(chn_signals["source"])
                 
                 if valid == 1 and ready == 1:
                     if chn != 'd':
-                        address = get_value(chn_all_signals[chn]["address"])
+                        address = get_value(chn_signals["address"])
 
                         if address == target_addr:
-                            opcode = get_value(chn_all_signals[chn]["opcode"])
+                            opcode = get_value(chn_signals["opcode"])
 
                             if chn == 'a':
                                 a_addr_current_source = source
                                 # 计算 GrantData 需要的拍数: 2^size / 数据总线宽度
-                                size = get_value(chn_all_signals[chn]["size"])
+                                size = get_value(chn_signals["size"])
                                 total_bytes = 1 << size
                                 a_addr_pending_beats = max(1, total_bytes // data_bus_bytes)
                             if chn == 'c' and (opcode == 6 or opcode == 7): # Release or ReleaseData
                                 c_addr_current_source = source
-                                size = get_value(chn_all_signals[chn]["size"])
+                                size = get_value(chn_signals["size"])
                                 total_bytes = 1 << size
                                 c_addr_pending_beats = max(1, total_bytes // data_bus_bytes)
                             
-                            param = get_value(chn_all_signals[chn]["param"])
-                            data = get_value(chn_all_signals[chn]["data"])
+                            param = get_value(chn_signals["param"])
+                            data = get_value(chn_signals["data"])
 
                             # print(f"Time: {time:5}, {cc:26}: "
                             #       f"{chn.upper()} {opcode_str(chn, opcode):12}, "
@@ -142,7 +155,7 @@ if __name__ == "__main__":
 
 
                     else: # chn == 'd'
-                        opcode = get_value(chn_all_signals[chn]["opcode"])
+                        opcode = get_value(chn_signals["opcode"])
                         d_match_a = (opcode == 4 or opcode == 5) and source == a_addr_current_source and a_addr_pending_beats > 0
                         d_match_c = opcode == 6 and source == c_addr_current_source and c_addr_pending_beats > 0
 
@@ -155,8 +168,8 @@ if __name__ == "__main__":
                             if c_addr_pending_beats == 0:
                                 c_addr_current_source = -1
                         if d_match_a or d_match_c:
-                            param = get_value(chn_all_signals[chn]["param"])
-                            data = get_value(chn_all_signals[chn]["data"])
+                            param = get_value(chn_signals["param"])
+                            data = get_value(chn_signals["data"])
 
                             print(f"{time:5} {tllog_site(cc):16} "
                                 f"{chn.upper()} {opcode_str(chn, opcode):12} "
